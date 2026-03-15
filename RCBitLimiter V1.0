@@ -1,0 +1,181 @@
+/*
+JSFX Name: RCBitLimiter V1.0
+Author: Dima Gorelik (based on RCBitRangeGain by RCJacH)
+Release Date: Mar 2026
+Reference:
+  AirWindows BitShiftGain (bit-accurate gain via exact powers of 2)
+  AirWindows PurestGain (anti-aliasing gain smoothing)
+About:
+  Bit-accurate lookahead limiter.
+
+  Key features:
+    1. Ceiling and input gain in bits (1 bit = 6.0206 dB), bit-accurate via 2^x
+    2. Lookahead buffer prevents peak overshoot (gain ramps down before peak arrives)
+    3. Minimum-gain lookahead: scans the entire lookahead window to find the worst
+       peak, so gain is pre-emptively reduced to the correct level
+    4. Stereo-linked by default (preserves stereo image)
+    5. Auto-release option (program-dependent: deeper limiting = slower release)
+    6. PurestGain smoothing on output (anti-aliasing)
+    7. PDC reported to REAPER for proper delay compensation
+
+  V1.0: Initial release
+*/
+
+// License: GPL - http://www.gnu.org/licenses/gpl.html
+
+desc: RCBitLimiter V1.0 - Bit-Accurate Lookahead Limiter
+
+in_pin:Left
+in_pin:Right
+out_pin:Left
+out_pin:Right
+
+slider1:0<0,8,0.01>Ceiling (Bits below 0 dBFS)
+slider2:0<-16,16,1>Input Gain (Bits)
+slider3:0<-100,100,0.01>Ceiling Micro (% of a Bit)
+slider4:5<0,10,0.1>Lookahead (ms)
+slider5:50<1,1000,1>Release (ms)
+slider6:0<0,1,1>Dual Mono (0=Linked, 1=Dual Mono)
+slider7:0<0,1,1>Auto Release (0=Manual, 1=Auto)
+slider8:1<0.1,10,0.1>Gain Smoothing
+
+@init
+BIT_DB = 20 * log10(2);
+
+// Delay buffer: max 10ms at 192kHz = 1920 per channel, round up to 2048
+MAX_BUF = 2048;
+buf_L = 0;
+buf_R = MAX_BUF;
+// Per-channel gain target buffers for lookahead scan
+buf_gain_L = MAX_BUF * 2;
+buf_gain_R = MAX_BUF * 3;
+buf_pos = 0;
+
+// Clear buffers
+memset(buf_L, 0, MAX_BUF);
+memset(buf_R, 0, MAX_BUF);
+memset(buf_gain_L, 0, MAX_BUF);
+memset(buf_gain_R, 0, MAX_BUF);
+
+// Per-channel envelope state
+env_L = env_R = 1;
+gain_crnt_L = gain_crnt_R = 1;
+
+// Auto-release coefficients
+auto_rel_fast = exp(-1 / (0.030 * srate)); // 30ms
+auto_rel_slow = exp(-1 / (0.500 * srate)); // 500ms
+
+@slider
+// Ceiling: bit-accurate (exact power of 2)
+ceiling = 1.0 / pow(2, slider1 + slider3 * 0.01);
+
+// Input gain: bit-accurate
+input_gain = pow(2, slider2);
+
+// Lookahead delay in samples
+delay_len = floor(slider4 * 0.001 * srate + 0.5);
+delay_len = min(max(delay_len, 0), MAX_BUF - 1);
+
+// Report PDC (plugin delay compensation) to REAPER
+pdc_delay = delay_len;
+pdc_bot_ch = 0;
+pdc_top_ch = 2;
+
+// Release coefficient
+release_coeff = exp(-1 / (slider5 * 0.001 * srate));
+
+// PurestGain smoothing
+gain_smooth = 400 * slider8;
+_gain_smooth = 1 / (gain_smooth + 1);
+
+// Flags
+dual_mono = slider6;
+auto_release = slider7;
+
+@sample
+// ========== INPUT GAIN (bit-accurate) ==========
+in_L = spl0 * input_gain;
+in_R = spl1 * input_gain;
+
+// ========== PER-CHANNEL TARGET GAIN ==========
+peak_L = abs(in_L);
+peak_R = abs(in_R);
+
+dual_mono ? (
+  // Dual mono: each channel has its own target
+  tgt_L = peak_L > ceiling ? ceiling / peak_L : 1;
+  tgt_R = peak_R > ceiling ? ceiling / peak_R : 1;
+) : (
+  // Stereo linked: use max peak, same target for both
+  peak_max = max(peak_L, peak_R);
+  tgt_L = tgt_R = peak_max > ceiling ? ceiling / peak_max : 1;
+);
+
+// ========== WRITE AUDIO AND GAIN TO BUFFERS ==========
+buf_L[buf_pos] = in_L;
+buf_R[buf_pos] = in_R;
+buf_gain_L[buf_pos] = tgt_L;
+buf_gain_R[buf_pos] = tgt_R;
+
+// ========== FIND MINIMUM GAIN IN LOOKAHEAD WINDOW ==========
+min_gain_L = 1;
+min_gain_R = 1;
+i = 0;
+loop(delay_len + 1,
+  scan_pos = buf_pos - i;
+  scan_pos < 0 ? scan_pos += MAX_BUF;
+  gL = buf_gain_L[scan_pos];
+  gR = buf_gain_R[scan_pos];
+  gL < min_gain_L ? min_gain_L = gL;
+  gR < min_gain_R ? min_gain_R = gR;
+  i += 1;
+);
+
+// ========== READ DELAYED AUDIO ==========
+read_pos = buf_pos - delay_len;
+read_pos < 0 ? read_pos += MAX_BUF;
+del_L = buf_L[read_pos];
+del_R = buf_R[read_pos];
+
+// ========== ADVANCE BUFFER ==========
+buf_pos += 1;
+buf_pos >= MAX_BUF ? buf_pos = 0;
+
+// ========== ENVELOPE: INSTANT ATTACK, SMOOTH RELEASE (per channel) ==========
+// Left
+min_gain_L < env_L ? (
+  env_L = min_gain_L;
+) : (
+  auto_release ? (
+    gr_dB = 20 * log10(env_L + 0.0000000001);
+    depth = min(abs(gr_dB) / 12, 1);
+    rel = auto_rel_fast + (auto_rel_slow - auto_rel_fast) * depth;
+  ) : (
+    rel = release_coeff;
+  );
+  env_L = min_gain_L + (env_L - min_gain_L) * rel;
+  env_L = min(env_L, 1);
+);
+
+// Right
+min_gain_R < env_R ? (
+  env_R = min_gain_R;
+) : (
+  auto_release ? (
+    gr_dB = 20 * log10(env_R + 0.0000000001);
+    depth = min(abs(gr_dB) / 12, 1);
+    rel = auto_rel_fast + (auto_rel_slow - auto_rel_fast) * depth;
+  ) : (
+    rel = release_coeff;
+  );
+  env_R = min_gain_R + (env_R - min_gain_R) * rel;
+  env_R = min(env_R, 1);
+);
+
+// ========== PURESTGAIN SMOOTHING (anti-aliasing, per channel) ==========
+gain_crnt_L = ((gain_crnt_L * gain_smooth) + env_L) * _gain_smooth;
+gain_crnt_R = ((gain_crnt_R * gain_smooth) + env_R) * _gain_smooth;
+
+// ========== APPLY GAIN TO DELAYED AUDIO ==========
+spl0 = del_L * gain_crnt_L;
+spl1 = del_R * gain_crnt_R;

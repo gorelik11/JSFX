@@ -1,0 +1,366 @@
+/*
+JSFX Name: RCBitComp V1.0
+Author: Dima Gorelik (based on RCBitRangeGain by RCJacH)
+Release Date: Mar 2026
+Reference:
+  AirWindows BitShiftGain (bit-accurate gain via exact powers of 2)
+  AirWindows PurestGain (anti-aliasing gain smoothing)
+  RCBitRangeGain by RCJacH (combined bit-shift + smooth gain)
+About:
+  Bit-accurate compressor combining downward and upward compression
+  with the anti-aliasing techniques from RCBitRangeGain.
+
+  Key differences from traditional compressors:
+    1. All gain is computed via 2^x (bit-accurate) instead of 10^(dB/20)
+    2. PurestGain smoothing on the output gain prevents aliasing artifacts
+    3. Threshold, makeup, and knee are specified in bits (1 bit = 6.0206 dB)
+    4. Proper RMS detection with configurable window (not just abs(x))
+    5. Sidechain with HPF/LPF filtering
+
+  V1.0: Initial release
+*/
+
+// License: GPL - http://www.gnu.org/licenses/gpl.html
+
+desc: RCBitComp V1.0 - Bit-Accurate Compressor
+
+in_pin:Left
+in_pin:Right
+in_pin:Sidechain Left
+in_pin:Sidechain Right
+out_pin:Left
+out_pin:Right
+
+// --- Downward Compression ---
+slider1:-3<-8,8,0.1>Downward Threshold (Bits)
+slider2:4<0.1,100,0.1>Downward Attack (ms)
+slider3:50<1,500,0.1>Downward Release (ms)
+slider4:0<-16,16,1>Makeup Gain (Bits)
+slider5:2<1,20,0.1>Downward Ratio
+slider6:1<0.1,10,0.1>Gain Smoothing
+slider7:100<0,100,0.1>Fader (% of total)
+slider8:0.5<0,1,0.01>Soft Knee (Bits)
+slider9:1<0,3,0.1>Bit Ratio
+
+// --- Sidechain ---
+slider10:0<0,1,1>Enable Sidechain (0=Off, 1=On)
+slider11:0<0,1000,10>Sidechain HPF (Hz)
+slider12:22000<1000,22000,100>Sidechain LPF (Hz)
+
+// --- Detection ---
+slider13:0<0,1,0.01>RMS/Peak Blend (0=Peak, 1=RMS)
+slider14:0<0,1,1>Auto Release (0=Manual, 1=Auto)
+slider15:10<1,100,1>RMS Window (ms)
+
+// --- Upward Compression ---
+slider16:-3<-8,8,0.1>Upward Threshold (Bits)
+slider17:2<1,20,0.1>Upward Ratio
+slider18:4<0.1,100,0.1>Upward Attack (ms)
+slider19:50<1,500,0.1>Upward Release (ms)
+slider20:0<0,1,1>Enable Upward Compression (0=Off, 1=On)
+
+// --- Mode ---
+slider21:0<0,1,1>Downward Dual Mono (0=Stereo, 1=Dual Mono)
+slider22:0<0,1,1>Upward Dual Mono (0=Stereo, 1=Dual Mono)
+
+// --- Fine Control ---
+slider24:0<-100,100,0.01>Micro Shift (% of a Bit)
+
+@init
+BIT_DB = 20 * log10(2); // 6.020599913... dB per bit
+NOISE_FLOOR_DB = -120;
+
+// Envelope followers (linear multipliers, start at unity)
+down_env_L = down_env_R = 1;
+up_env_L = up_env_R = 1;
+
+// PurestGain smoothing state
+gain_crnt_L = gain_crnt_R = 1;
+fader_crnt = 1;
+
+// RMS state
+rms_sq_L = rms_sq_R = 0;
+
+// Sidechain filter state (biquad)
+sc_hpf_xl1 = sc_hpf_xl2 = sc_hpf_yl1 = sc_hpf_yl2 = 0;
+sc_hpf_xr1 = sc_hpf_xr2 = sc_hpf_yr1 = sc_hpf_yr2 = 0;
+sc_lpf_xl1 = sc_lpf_xl2 = sc_lpf_yl1 = sc_lpf_yl2 = 0;
+sc_lpf_xr1 = sc_lpf_xr2 = sc_lpf_yr1 = sc_lpf_yr2 = 0;
+
+@slider
+bit_ratio = slider9;
+
+// Thresholds in dB
+down_thresh_dB = slider1 * BIT_DB * bit_ratio;
+up_thresh_dB = slider16 * BIT_DB * bit_ratio;
+
+// Soft knee half-width in dB
+half_knee_dB = slider8 * BIT_DB * bit_ratio;
+
+// Ratios
+down_ratio = slider5;
+up_ratio = slider17;
+
+// Makeup gain: bit-accurate (2^x), includes micro shift
+makeup = pow(2, (slider4 + slider24 * 0.01) * bit_ratio);
+
+// Fader target (linear)
+fader_tgt = slider7 * 0.01;
+
+// Downward attack/release coefficients
+down_att_coeff = exp(-1 / (slider2 * 0.001 * srate));
+down_rel_coeff = exp(-1 / (slider3 * 0.001 * srate));
+
+// Upward attack/release coefficients
+up_att_coeff = exp(-1 / (slider18 * 0.001 * srate));
+up_rel_coeff = exp(-1 / (slider19 * 0.001 * srate));
+
+// Auto-release: blend between fast (50ms) and slow (500ms) based on GR depth
+auto_release = slider14;
+auto_rel_fast = exp(-1 / (0.050 * srate));
+auto_rel_slow = exp(-1 / (0.500 * srate));
+
+// RMS settings
+rms_blend = slider13;
+rms_window_ms = slider15;
+rms_samples = rms_window_ms * 0.001 * srate;
+rms_coeff = rms_samples > 1 ? exp(-1 / rms_samples) : 0;
+
+// PurestGain smoothing (same algorithm as RCBitRangeGain)
+// Default slider6=1 gives gain_smooth=400 (~9ms at 44.1kHz)
+gain_smooth = 400 * slider6;
+_gain_smooth = 1 / (gain_smooth + 1);
+
+// Sidechain
+sidechain_on = slider10;
+
+// Sidechain HPF (biquad)
+sc_hpf_freq = slider11;
+sc_hpf_on = sc_hpf_freq > 0;
+sc_hpf_on ? (
+  omega = 2 * $pi * sc_hpf_freq / srate;
+  cosw = cos(omega);
+  alpha = sin(omega) / (2 * 0.7071); // Q = 0.7071 (Butterworth)
+  a0 = 1 + alpha;
+  sc_hpf_b0 = ((1 + cosw) / 2) / a0;
+  sc_hpf_b1 = (-(1 + cosw)) / a0;
+  sc_hpf_b2 = sc_hpf_b0;
+  sc_hpf_a1 = (-2 * cosw) / a0;
+  sc_hpf_a2 = (1 - alpha) / a0;
+);
+
+// Sidechain LPF (biquad)
+sc_lpf_freq = slider12;
+sc_lpf_on = sc_lpf_freq < 22000;
+sc_lpf_on ? (
+  omega = 2 * $pi * sc_lpf_freq / srate;
+  cosw = cos(omega);
+  alpha = sin(omega) / (2 * 0.7071);
+  a0 = 1 + alpha;
+  sc_lpf_b0 = ((1 - cosw) / 2) / a0;
+  sc_lpf_b1 = (1 - cosw) / a0;
+  sc_lpf_b2 = sc_lpf_b0;
+  sc_lpf_a1 = (-2 * cosw) / a0;
+  sc_lpf_a2 = (1 - alpha) / a0;
+);
+
+// Flags
+enable_upward = slider20;
+down_dual_mono = slider21;
+up_dual_mono = slider22;
+
+@sample
+// ========== INPUT SELECTION ==========
+sc_L = sidechain_on ? spl2 : spl0;
+sc_R = sidechain_on ? spl3 : spl1;
+
+// ========== SIDECHAIN HPF ==========
+sc_hpf_on ? (
+  out = sc_hpf_b0 * sc_L + sc_hpf_b1 * sc_hpf_xl1 + sc_hpf_b2 * sc_hpf_xl2
+      - sc_hpf_a1 * sc_hpf_yl1 - sc_hpf_a2 * sc_hpf_yl2;
+  sc_hpf_xl2 = sc_hpf_xl1; sc_hpf_xl1 = sc_L;
+  sc_hpf_yl2 = sc_hpf_yl1; sc_hpf_yl1 = out;
+  sc_L = out;
+
+  out = sc_hpf_b0 * sc_R + sc_hpf_b1 * sc_hpf_xr1 + sc_hpf_b2 * sc_hpf_xr2
+      - sc_hpf_a1 * sc_hpf_yr1 - sc_hpf_a2 * sc_hpf_yr2;
+  sc_hpf_xr2 = sc_hpf_xr1; sc_hpf_xr1 = sc_R;
+  sc_hpf_yr2 = sc_hpf_yr1; sc_hpf_yr1 = out;
+  sc_R = out;
+);
+
+// ========== SIDECHAIN LPF ==========
+sc_lpf_on ? (
+  out = sc_lpf_b0 * sc_L + sc_lpf_b1 * sc_lpf_xl1 + sc_lpf_b2 * sc_lpf_xl2
+      - sc_lpf_a1 * sc_lpf_yl1 - sc_lpf_a2 * sc_lpf_yl2;
+  sc_lpf_xl2 = sc_lpf_xl1; sc_lpf_xl1 = sc_L;
+  sc_lpf_yl2 = sc_lpf_yl1; sc_lpf_yl1 = out;
+  sc_L = out;
+
+  out = sc_lpf_b0 * sc_R + sc_lpf_b1 * sc_lpf_xr1 + sc_lpf_b2 * sc_lpf_xr2
+      - sc_lpf_a1 * sc_lpf_yr1 - sc_lpf_a2 * sc_lpf_yr2;
+  sc_lpf_xr2 = sc_lpf_xr1; sc_lpf_xr1 = sc_R;
+  sc_lpf_yr2 = sc_lpf_yr1; sc_lpf_yr1 = out;
+  sc_R = out;
+);
+
+// ========== LEVEL DETECTION ==========
+// Peak (instantaneous)
+peak_L = abs(sc_L);
+peak_R = abs(sc_R);
+
+// RMS (running average of squared samples, proper implementation)
+rms_sq_L = rms_sq_L * rms_coeff + sc_L * sc_L * (1 - rms_coeff);
+rms_sq_R = rms_sq_R * rms_coeff + sc_R * sc_R * (1 - rms_coeff);
+rms_L = sqrt(rms_sq_L);
+rms_R = sqrt(rms_sq_R);
+
+// Blend peak and RMS
+det_L = peak_L + (rms_L - peak_L) * rms_blend;
+det_R = peak_R + (rms_R - peak_R) * rms_blend;
+
+// ========== DOWNWARD COMPRESSION ==========
+// Stereo link: stereo uses max of both channels, dual mono uses each independently
+down_dual_mono ? (
+  det_dL = det_L;
+  det_dR = det_R;
+) : (
+  det_dL = det_dR = max(det_L, det_R);
+);
+
+// Convert to dB
+in_dB_dL = 20 * log10(det_dL + 0.0000000001);
+in_dB_dR = 20 * log10(det_dR + 0.0000000001);
+
+// How far above threshold (positive = above)
+over_L = in_dB_dL - down_thresh_dB;
+over_R = in_dB_dR - down_thresh_dB;
+
+// Gain reduction in dB (positive = reduce) with soft knee
+half_knee_dB > 0 ? (
+  // Left channel
+  over_L > half_knee_dB ? (
+    // Above knee: full compression
+    down_gr_dB_L = over_L * (1 - 1 / down_ratio);
+  ) : over_L > -half_knee_dB ? (
+    // In knee zone: smooth quadratic transition
+    t = (over_L + half_knee_dB) / (2 * half_knee_dB);
+    down_gr_dB_L = t * t * half_knee_dB * (1 - 1 / down_ratio);
+  ) : (
+    // Below knee: no compression
+    down_gr_dB_L = 0;
+  );
+  // Right channel
+  over_R > half_knee_dB ? (
+    down_gr_dB_R = over_R * (1 - 1 / down_ratio);
+  ) : over_R > -half_knee_dB ? (
+    t = (over_R + half_knee_dB) / (2 * half_knee_dB);
+    down_gr_dB_R = t * t * half_knee_dB * (1 - 1 / down_ratio);
+  ) : (
+    down_gr_dB_R = 0;
+  );
+) : (
+  // Hard knee
+  down_gr_dB_L = over_L > 0 ? over_L * (1 - 1 / down_ratio) : 0;
+  down_gr_dB_R = over_R > 0 ? over_R * (1 - 1 / down_ratio) : 0;
+);
+
+// Target gain multiplier (bit-accurate: 2^(-bits) instead of 10^(-dB/20))
+down_tgt_L = pow(2, -down_gr_dB_L / BIT_DB);
+down_tgt_R = pow(2, -down_gr_dB_R / BIT_DB);
+
+// Envelope follower (attack/release ballistics)
+auto_release ? (
+  // Program-dependent: blend fast/slow release based on GR depth
+  // Deeper compression → slower release (more natural)
+  blend_L = min(down_gr_dB_L / 12, 1);
+  blend_R = min(down_gr_dB_R / 12, 1);
+  rel_L = auto_rel_fast + (auto_rel_slow - auto_rel_fast) * blend_L;
+  rel_R = auto_rel_fast + (auto_rel_slow - auto_rel_fast) * blend_R;
+) : (
+  rel_L = rel_R = down_rel_coeff;
+);
+
+// Attack when target < current (reducing gain), release when target > current
+down_env_L = down_tgt_L < down_env_L
+  ? down_tgt_L + (down_env_L - down_tgt_L) * down_att_coeff
+  : down_tgt_L + (down_env_L - down_tgt_L) * rel_L;
+down_env_R = down_tgt_R < down_env_R
+  ? down_tgt_R + (down_env_R - down_tgt_R) * down_att_coeff
+  : down_tgt_R + (down_env_R - down_tgt_R) * rel_R;
+
+// ========== UPWARD COMPRESSION ==========
+enable_upward ? (
+  // Stereo link
+  up_dual_mono ? (
+    det_uL = det_L;
+    det_uR = det_R;
+  ) : (
+    det_uL = det_uR = max(det_L, det_R);
+  );
+
+  // Convert to dB (clamp to noise floor to prevent boosting silence)
+  in_dB_uL = max(20 * log10(det_uL + 0.0000000001), NOISE_FLOOR_DB);
+  in_dB_uR = max(20 * log10(det_uR + 0.0000000001), NOISE_FLOOR_DB);
+
+  // How far below threshold (positive = below)
+  under_L = up_thresh_dB - in_dB_uL;
+  under_R = up_thresh_dB - in_dB_uR;
+
+  // Gain boost in dB with soft knee
+  half_knee_dB > 0 ? (
+    // Left
+    under_L > half_knee_dB ? (
+      up_boost_dB_L = under_L * (1 - 1 / up_ratio);
+    ) : under_L > -half_knee_dB ? (
+      t = (under_L + half_knee_dB) / (2 * half_knee_dB);
+      up_boost_dB_L = t * t * half_knee_dB * (1 - 1 / up_ratio);
+    ) : (
+      up_boost_dB_L = 0;
+    );
+    // Right
+    under_R > half_knee_dB ? (
+      up_boost_dB_R = under_R * (1 - 1 / up_ratio);
+    ) : under_R > -half_knee_dB ? (
+      t = (under_R + half_knee_dB) / (2 * half_knee_dB);
+      up_boost_dB_R = t * t * half_knee_dB * (1 - 1 / up_ratio);
+    ) : (
+      up_boost_dB_R = 0;
+    );
+  ) : (
+    // Hard knee
+    up_boost_dB_L = under_L > 0 ? under_L * (1 - 1 / up_ratio) : 0;
+    up_boost_dB_R = under_R > 0 ? under_R * (1 - 1 / up_ratio) : 0;
+  );
+
+  // Target boost multiplier (bit-accurate)
+  up_tgt_L = pow(2, up_boost_dB_L / BIT_DB);
+  up_tgt_R = pow(2, up_boost_dB_R / BIT_DB);
+
+  // Envelope follower: attack when boost increases, release when it decreases
+  up_env_L = up_tgt_L > up_env_L
+    ? up_tgt_L + (up_env_L - up_tgt_L) * up_att_coeff
+    : up_tgt_L + (up_env_L - up_tgt_L) * up_rel_coeff;
+  up_env_R = up_tgt_R > up_env_R
+    ? up_tgt_R + (up_env_R - up_tgt_R) * up_att_coeff
+    : up_tgt_R + (up_env_R - up_tgt_R) * up_rel_coeff;
+) : (
+  up_env_L = up_env_R = 1;
+);
+
+// ========== COMBINE: downward * upward * makeup ==========
+total_tgt_L = down_env_L * up_env_L * makeup;
+total_tgt_R = down_env_R * up_env_R * makeup;
+
+// ========== PURESTGAIN SMOOTHING (anti-aliasing) ==========
+// One-pole lowpass on the gain multiplier prevents discontinuities
+// Same algorithm as RCBitRangeGain: y = (y*S + target) / (S+1)
+gain_crnt_L = ((gain_crnt_L * gain_smooth) + total_tgt_L) * _gain_smooth;
+gain_crnt_R = ((gain_crnt_R * gain_smooth) + total_tgt_R) * _gain_smooth;
+
+// Fader also gets PurestGain smoothing
+fader_crnt = ((fader_crnt * gain_smooth) + fader_tgt) * _gain_smooth;
+
+// ========== APPLY TO AUDIO ==========
+spl0 *= gain_crnt_L * fader_crnt;
+spl1 *= gain_crnt_R * fader_crnt;

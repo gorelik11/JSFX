@@ -1,0 +1,201 @@
+/*
+JSFX Name: RCBitBrickwall V1.0
+Author: Dima Gorelik
+Release Date: Mar 2026
+Reference:
+  RCBitLimiter V1.0 (bit-accurate ceiling concept)
+  Geraint Luff Smooth Limiter (cosine-windowed lookahead attack)
+  AirWindows BitShiftGain (bit-accurate gain via exact powers of 2)
+About:
+  Bit-accurate brickwall lookahead limiter.
+
+  Combines bit-accurate ceiling (exact powers of 2) with cosine-windowed
+  lookahead gain reduction for transparent, alias-free limiting.
+
+  Key features:
+    1. Ceiling in bits (1 bit = 6.0206 dB), bit-accurate via 2^x
+    2. Input gain in bits, bit-accurate
+    3. Cosine-windowed attack: gain ramps down smoothly before peak arrives
+       (no discontinuities = no aliasing)
+    4. Lookahead scans the entire window for worst peak, pre-shapes gain curve
+    5. Smooth release (exponential or program-dependent auto)
+    6. Hard clamp safety net (ceiling cap) — rarely triggers with proper lookahead
+    7. Stereo-linked (preserves stereo image)
+    8. Auto-release option (program-dependent)
+    9. PDC reported to REAPER
+
+  CPU-efficient: cosine reshaping only runs when a new deeper peak is detected,
+  not on every sample. Peak scan uses the full lookahead window.
+*/
+
+// License: GPL - http://www.gnu.org/licenses/gpl.html
+
+desc: RCBitBrickwall V1.0 - Bit-Accurate Brickwall Limiter
+
+in_pin:Left
+in_pin:Right
+out_pin:Left
+out_pin:Right
+
+slider1:0<0,8,0.01>Ceiling (Bits below 0 dBFS)
+slider2:0<-16,16,1>Input Gain (Bits)
+slider3:0<-100,100,0.01>Ceiling Micro (% of a Bit)
+slider4:5<0.1,10,0.1>Lookahead (ms)
+slider5:100<1,1000,1>Release (ms)
+slider6:0<0,1,1{Manual,Auto}>Release Mode
+
+@init
+
+// Delay buffer: max 10ms at 192kHz = 1920, round up to 2048
+MAX_BUF = 2048;
+buf_L = 0;
+buf_R = MAX_BUF;
+buf_peak = MAX_BUF * 2;
+buf_gain = MAX_BUF * 3;
+buf_pos = 0;
+
+memset(buf_L, 0, MAX_BUF);
+memset(buf_R, 0, MAX_BUF);
+memset(buf_peak, 0, MAX_BUF);
+memset(buf_gain, 0, MAX_BUF);
+i = 0;
+loop(MAX_BUF, buf_gain[i] = 1; i += 1;);
+
+// Envelope state
+env_gain = 1;
+prev_env_gain = 1;
+
+// Auto-release coefficients
+auto_rel_fast = exp(-1 / (0.030 * srate));
+auto_rel_slow = exp(-1 / (0.500 * srate));
+
+// Safety clamp counter
+clamp_count = 0;
+
+@slider
+
+// Ceiling: bit-accurate (exact power of 2)
+ceiling = 1.0 / pow(2, slider1 + slider3 * 0.01);
+
+// Input gain: bit-accurate
+input_gain = pow(2, slider2);
+
+// Lookahead delay in samples
+delay_len = floor(slider4 * 0.001 * srate + 0.5);
+delay_len = min(max(delay_len, 1), MAX_BUF - 1);
+
+// Report PDC
+pdc_delay = delay_len;
+pdc_bot_ch = 0;
+pdc_top_ch = 2;
+
+// Release coefficient
+release_coeff = exp(-1 / (slider5 * 0.001 * srate));
+
+// Flags
+auto_release = slider6;
+
+@sample
+
+// ========== INPUT GAIN (bit-accurate) ==========
+in_L = spl0 * input_gain;
+in_R = spl1 * input_gain;
+
+// ========== PEAK DETECTION (stereo linked) ==========
+peak = max(abs(in_L), abs(in_R));
+
+// ========== WRITE TO BUFFERS ==========
+buf_L[buf_pos] = in_L;
+buf_R[buf_pos] = in_R;
+buf_peak[buf_pos] = peak;
+
+// ========== LOOKAHEAD: FIND WORST PEAK IN WINDOW ==========
+worst_peak = 0;
+i = 0;
+loop(delay_len + 1,
+  scan_pos = buf_pos - i;
+  scan_pos < 0 ? scan_pos += MAX_BUF;
+  p = buf_peak[scan_pos];
+  p > worst_peak ? worst_peak = p;
+  i += 1;
+);
+
+// Target gain for this lookahead window
+tgt_gain = worst_peak > ceiling ? ceiling / worst_peak : 1;
+
+// ========== ENVELOPE: INSTANT ATTACK, SMOOTH RELEASE ==========
+prev_env_gain = env_gain;
+
+tgt_gain < env_gain ? (
+  env_gain = tgt_gain;
+) : (
+  auto_release ? (
+    gr_dB = 20 * log10(env_gain + 0.0000000001);
+    depth = min(abs(gr_dB) / 12, 1);
+    rel = auto_rel_fast + (auto_rel_slow - auto_rel_fast) * depth;
+  ) : (
+    rel = release_coeff;
+  );
+  env_gain = tgt_gain + (env_gain - tgt_gain) * rel;
+  env_gain = min(env_gain, 1);
+);
+
+// ========== COSINE-WINDOWED GAIN SHAPING ==========
+// Only reshape the gain buffer when envelope drops to a new low.
+// This is the expensive cosine loop — but it only fires on new peaks,
+// not every sample. Saves massive CPU.
+env_gain < prev_env_gain ? (
+  // New deeper gain detected — reshape the lookahead window
+  i = 0;
+  loop(delay_len,
+    shape_pos = buf_pos - i;
+    shape_pos < 0 ? shape_pos += MAX_BUF;
+
+    // Cosine S-curve: 0 at newest (i=0), 1 at oldest (i=delay_len)
+    ratio = i / delay_len;
+    window = 0.5 - 0.5 * cos(ratio * $pi);
+
+    old_gain = buf_gain[shape_pos];
+    new_gain = env_gain + (old_gain - env_gain) * window;
+
+    // Only reshape downward
+    new_gain < old_gain ? buf_gain[shape_pos] = new_gain;
+
+    i += 1;
+  );
+);
+
+// Current position: always apply envelope
+buf_gain[buf_pos] = min(buf_gain[buf_pos], env_gain);
+
+// ========== READ DELAYED AUDIO ==========
+read_pos = buf_pos - delay_len;
+read_pos < 0 ? read_pos += MAX_BUF;
+
+del_L = buf_L[read_pos];
+del_R = buf_R[read_pos];
+apply_gain = buf_gain[read_pos];
+
+// Reset gain slot for reuse
+buf_gain[read_pos] = 1;
+
+// ========== APPLY GAIN ==========
+out_L = del_L * apply_gain;
+out_R = del_R * apply_gain;
+
+// ========== SAFETY CLAMP (brickwall guarantee) ==========
+abs(out_L) > ceiling ? (
+  out_L = out_L > 0 ? ceiling : -ceiling;
+  clamp_count += 1;
+);
+abs(out_R) > ceiling ? (
+  out_R = out_R > 0 ? ceiling : -ceiling;
+  clamp_count += 1;
+);
+
+spl0 = out_L;
+spl1 = out_R;
+
+// ========== ADVANCE BUFFER ==========
+buf_pos += 1;
+buf_pos >= MAX_BUF ? buf_pos = 0;

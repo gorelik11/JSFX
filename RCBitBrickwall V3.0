@@ -1,0 +1,295 @@
+/*
+JSFX Name: RCBitBrickwall V3.0
+Author: Dima Gorelik
+Release Date: Mar 2026
+Reference:
+  RCBitLimiter V1.0 (bit-accurate ceiling concept)
+  Geraint Luff Smooth Limiter (cosine-windowed lookahead attack)
+  AirWindows BitShiftGain (bit-accurate gain via exact powers of 2)
+  ITU-R BS.1770 (true peak detection concept)
+About:
+  Bit-accurate brickwall lookahead limiter with oversampled peak detection.
+
+  Key features:
+    1. Ceiling in bits (1 bit = 6.0206 dB), bit-accurate via 2^x
+    2. Input gain in bits, bit-accurate
+    3. Cosine-windowed attack: smooth gain ramp, no aliasing
+    4. Oversampled peak detection (1x/2x/4x/8x) via Hermite cubic interpolation
+       Catches inter-sample peaks without oversampling the whole signal path
+    5. Stereo Linked or Dual Mono
+    6. Auto-release option (program-dependent)
+    7. PDC reported to REAPER
+
+  CPU-efficient: cosine reshaping only on new peaks.
+  Oversampling is detection-only (cheap cubic interpolation, not full FIR).
+
+  V3.0: Oversampled peak detection, dual mono.
+  V2.0: True dual mono.
+  V1.0: Initial release.
+*/
+
+// License: GPL - http://www.gnu.org/licenses/gpl.html
+
+desc: RCBitBrickwall V3.0 - Bit-Accurate Brickwall Limiter
+
+in_pin:Left
+in_pin:Right
+out_pin:Left
+out_pin:Right
+
+slider1:0<0,8,0.01>Ceiling (Bits below 0 dBFS)
+slider2:0<-16,16,1>Input Gain (Bits)
+slider3:0<-100,100,0.01>Ceiling Micro (% of a Bit)
+slider4:5<0.1,10,0.1>Lookahead (ms)
+slider5:100<1,1000,1>Release (ms)
+slider6:0<0,1,1{Manual,Auto}>Release Mode
+slider7:0<0,1,1{Linked,Dual Mono}>Stereo Mode
+slider8:2<0,3,1{1x (Off),2x,4x,8x}>Peak Oversampling
+
+@init
+
+MAX_BUF = 2048;
+
+// Audio buffers
+buf_L = 0;
+buf_R = MAX_BUF;
+
+// Per-channel peak and gain buffers
+buf_peak_L = MAX_BUF * 2;
+buf_peak_R = MAX_BUF * 3;
+buf_gain_L = MAX_BUF * 4;
+buf_gain_R = MAX_BUF * 5;
+
+buf_pos = 0;
+
+memset(buf_L, 0, MAX_BUF);
+memset(buf_R, 0, MAX_BUF);
+memset(buf_peak_L, 0, MAX_BUF);
+memset(buf_peak_R, 0, MAX_BUF);
+memset(buf_gain_L, 0, MAX_BUF);
+memset(buf_gain_R, 0, MAX_BUF);
+i = 0;
+loop(MAX_BUF,
+  buf_gain_L[i] = 1;
+  buf_gain_R[i] = 1;
+  i += 1;
+);
+
+// Per-channel envelope state
+env_gain_L = 1; prev_env_L = 1;
+env_gain_R = 1; prev_env_R = 1;
+
+// Auto-release coefficients
+auto_rel_fast = exp(-1 / (0.030 * srate));
+auto_rel_slow = exp(-1 / (0.500 * srate));
+
+clamp_count = 0;
+
+// Hermite interpolation history (4 samples per channel)
+hist_L0 = 0; hist_L1 = 0; hist_L2 = 0; hist_L3 = 0;
+hist_R0 = 0; hist_R1 = 0; hist_R2 = 0; hist_R3 = 0;
+
+// Oversampling factor
+os_factor = 4;
+
+@slider
+
+ceiling = 1.0 / pow(2, slider1 + slider3 * 0.01);
+input_gain = pow(2, slider2);
+
+delay_len = floor(slider4 * 0.001 * srate + 0.5);
+delay_len = min(max(delay_len, 1), MAX_BUF - 1);
+
+pdc_delay = delay_len;
+pdc_bot_ch = 0;
+pdc_top_ch = 2;
+
+release_coeff = exp(-1 / (slider5 * 0.001 * srate));
+auto_release = slider6;
+dual_mono = slider7;
+
+// Oversampling: 0=1x, 1=2x, 2=4x, 3=8x
+os_factor = 1 << slider8; // 1, 2, 4, 8
+
+@sample
+
+// ========== INPUT GAIN (bit-accurate) ==========
+in_L = spl0 * input_gain;
+in_R = spl1 * input_gain;
+
+// ========== OVERSAMPLED PEAK DETECTION ==========
+// Shift history (y0 is oldest, y3 is newest)
+hist_L0 = hist_L1; hist_L1 = hist_L2; hist_L2 = hist_L3; hist_L3 = in_L;
+hist_R0 = hist_R1; hist_R1 = hist_R2; hist_R2 = hist_R3; hist_R3 = in_R;
+
+// Start with the actual sample peaks (between hist_L2 and hist_L3 region)
+tp_L = abs(in_L);
+tp_R = abs(in_R);
+
+os_factor > 1 ? (
+  // Hermite cubic interpolation coefficients for L channel
+  // Interpolates between hist_L1 and hist_L2 (the "current" interval)
+  // y0=hist_L0, y1=hist_L1, y2=hist_L2, y3=hist_L3
+  // At t=0 gives y1, at t=1 gives y2
+  aL = -0.5*hist_L0 + 1.5*hist_L1 - 1.5*hist_L2 + 0.5*hist_L3;
+  bL =      hist_L0 - 2.5*hist_L1 + 2.0*hist_L2 - 0.5*hist_L3;
+  cL = -0.5*hist_L0               + 0.5*hist_L2;
+  dL = hist_L1;
+
+  // Same for R
+  aR = -0.5*hist_R0 + 1.5*hist_R1 - 1.5*hist_R2 + 0.5*hist_R3;
+  bR =      hist_R0 - 2.5*hist_R1 + 2.0*hist_R2 - 0.5*hist_R3;
+  cR = -0.5*hist_R0               + 0.5*hist_R2;
+  dR = hist_R1;
+
+  // Check the original sample points too
+  tp_L = max(tp_L, abs(hist_L1));
+  tp_L = max(tp_L, abs(hist_L2));
+  tp_R = max(tp_R, abs(hist_R1));
+  tp_R = max(tp_R, abs(hist_R2));
+
+  // Evaluate at intermediate points
+  step = 1.0 / os_factor;
+  t = step; // skip t=0 (that's hist_L1, already checked)
+  j = 1;
+  loop(os_factor - 1,
+    // Horner's method: ((a*t + b)*t + c)*t + d
+    valL = ((aL * t + bL) * t + cL) * t + dL;
+    valR = ((aR * t + bR) * t + cR) * t + dR;
+    tp_L = max(tp_L, abs(valL));
+    tp_R = max(tp_R, abs(valR));
+    t += step;
+    j += 1;
+  );
+);
+
+// ========== WRITE TO BUFFERS ==========
+buf_L[buf_pos] = in_L;
+buf_R[buf_pos] = in_R;
+
+dual_mono ? (
+  buf_peak_L[buf_pos] = tp_L;
+  buf_peak_R[buf_pos] = tp_R;
+) : (
+  tp_max = max(tp_L, tp_R);
+  buf_peak_L[buf_pos] = tp_max;
+  buf_peak_R[buf_pos] = tp_max;
+);
+
+// ========== LOOKAHEAD: FIND WORST PEAK PER CHANNEL ==========
+worst_L = 0;
+worst_R = 0;
+i = 0;
+loop(delay_len + 1,
+  scan_pos = buf_pos - i;
+  scan_pos < 0 ? scan_pos += MAX_BUF;
+  p = buf_peak_L[scan_pos];
+  p > worst_L ? worst_L = p;
+  p = buf_peak_R[scan_pos];
+  p > worst_R ? worst_R = p;
+  i += 1;
+);
+
+tgt_L = worst_L > ceiling ? ceiling / worst_L : 1;
+tgt_R = worst_R > ceiling ? ceiling / worst_R : 1;
+
+// ========== ENVELOPE: INSTANT ATTACK, SMOOTH RELEASE ==========
+prev_env_L = env_gain_L;
+prev_env_R = env_gain_R;
+
+// Left
+tgt_L < env_gain_L ? (
+  env_gain_L = tgt_L;
+) : (
+  auto_release ? (
+    gr_dB = 20 * log10(env_gain_L + 0.0000000001);
+    depth = min(abs(gr_dB) / 12, 1);
+    rel = auto_rel_fast + (auto_rel_slow - auto_rel_fast) * depth;
+  ) : (
+    rel = release_coeff;
+  );
+  env_gain_L = tgt_L + (env_gain_L - tgt_L) * rel;
+  env_gain_L = min(env_gain_L, 1);
+);
+
+// Right
+tgt_R < env_gain_R ? (
+  env_gain_R = tgt_R;
+) : (
+  auto_release ? (
+    gr_dB = 20 * log10(env_gain_R + 0.0000000001);
+    depth = min(abs(gr_dB) / 12, 1);
+    rel = auto_rel_fast + (auto_rel_slow - auto_rel_fast) * depth;
+  ) : (
+    rel = release_coeff;
+  );
+  env_gain_R = tgt_R + (env_gain_R - tgt_R) * rel;
+  env_gain_R = min(env_gain_R, 1);
+);
+
+// ========== COSINE-WINDOWED GAIN SHAPING (only on new peaks) ==========
+
+// Left
+env_gain_L < prev_env_L ? (
+  i = 0;
+  loop(delay_len,
+    shape_pos = buf_pos - i;
+    shape_pos < 0 ? shape_pos += MAX_BUF;
+    ratio = i / delay_len;
+    window = 0.5 - 0.5 * cos(ratio * $pi);
+    old_gain = buf_gain_L[shape_pos];
+    new_gain = env_gain_L + (old_gain - env_gain_L) * window;
+    new_gain < old_gain ? buf_gain_L[shape_pos] = new_gain;
+    i += 1;
+  );
+);
+buf_gain_L[buf_pos] = min(buf_gain_L[buf_pos], env_gain_L);
+
+// Right
+env_gain_R < prev_env_R ? (
+  i = 0;
+  loop(delay_len,
+    shape_pos = buf_pos - i;
+    shape_pos < 0 ? shape_pos += MAX_BUF;
+    ratio = i / delay_len;
+    window = 0.5 - 0.5 * cos(ratio * $pi);
+    old_gain = buf_gain_R[shape_pos];
+    new_gain = env_gain_R + (old_gain - env_gain_R) * window;
+    new_gain < old_gain ? buf_gain_R[shape_pos] = new_gain;
+    i += 1;
+  );
+);
+buf_gain_R[buf_pos] = min(buf_gain_R[buf_pos], env_gain_R);
+
+// ========== READ DELAYED AUDIO ==========
+read_pos = buf_pos - delay_len;
+read_pos < 0 ? read_pos += MAX_BUF;
+
+del_L = buf_L[read_pos];
+del_R = buf_R[read_pos];
+gain_L = buf_gain_L[read_pos];
+gain_R = buf_gain_R[read_pos];
+
+buf_gain_L[read_pos] = 1;
+buf_gain_R[read_pos] = 1;
+
+// ========== APPLY GAIN ==========
+out_L = del_L * gain_L;
+out_R = del_R * gain_R;
+
+// ========== SAFETY CLAMP (brickwall guarantee) ==========
+abs(out_L) > ceiling ? (
+  out_L = out_L > 0 ? ceiling : -ceiling;
+  clamp_count += 1;
+);
+abs(out_R) > ceiling ? (
+  out_R = out_R > 0 ? ceiling : -ceiling;
+  clamp_count += 1;
+);
+
+spl0 = out_L;
+spl1 = out_R;
+
+// ========== ADVANCE BUFFER ==========
+buf_pos += 1;
+buf_pos >= MAX_BUF ? buf_pos = 0;
