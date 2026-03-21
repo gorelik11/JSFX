@@ -4,13 +4,14 @@ Bit-accurate dynamics processing plugins for REAPER. All gain values use exact p
 
 ## Plugins
 
-### RCBitBrickwall V3.0 — Brickwall Limiter (recommended)
+### RCBitBrickwall V4.0 — Brickwall Limiter (recommended)
 
-True brickwall lookahead limiter with oversampled peak detection.
+True brickwall lookahead limiter with switchable Light/HQ modes.
 
+- **Light mode** (default) — near-zero CPU. Envelope runs on live signal, applied to delayed audio. Perfect for monitoring and mixing
+- **HQ mode** — full lookahead scan + cosine-windowed gain reshaping for maximum transparency. Use for final renders
 - **Bit-accurate ceiling** — exact power of 2, no rounding artifacts
-- **Cosine-windowed attack** — gain ramps down smoothly before peak arrives via lookahead buffer, no discontinuities = no aliasing
-- **Oversampled peak detection** — 1x/2x/4x/8x via Hermite cubic interpolation. Catches inter-sample peaks without oversampling the whole signal path (CPU-light)
+- **Oversampled peak detection** — 1x/2x/4x/8x via Hermite cubic interpolation. Catches inter-sample peaks without oversampling the whole signal path
 - **Safety clamp** — hard ceiling guarantee as last resort; with 5–10ms lookahead it rarely fires
 - **Stereo Linked / Dual Mono** — independent per-channel envelopes and gain buffers in dual mono mode
 - **Auto-release** — program-dependent: deeper limiting = slower release
@@ -26,6 +27,7 @@ True brickwall lookahead limiter with oversampled peak detection.
 | Release Mode | Manual/Auto | Manual | Auto = program-dependent |
 | Stereo Mode | Linked/Dual Mono | Linked | Independent per-channel limiting |
 | Peak Oversampling | 1x/2x/4x/8x | 4x | Inter-sample peak detection |
+| Quality | Light/HQ | Light | Light = low CPU, HQ = cosine-windowed attack |
 
 ### RCBitLimiter V1.0 — Soft Lookahead Limiter
 
@@ -37,8 +39,10 @@ Bit-accurate compressor with downward and upward compression, RMS detection, and
 
 ## Older Versions
 
+- **RCBitBrickwall Light V1.0** — standalone Light mode version
+- **RCBitBrickwall V3.0** — HQ only, no Light/HQ switch
+- **RCBitBrickwall V2.0** — dual mono, no oversampling
 - **RCBitBrickwall V1.0** — stereo linked only, no oversampling
-- **RCBitBrickwall V2.0** — adds dual mono, no oversampling
 
 ## Installation
 

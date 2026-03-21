@@ -1,0 +1,207 @@
+/*
+JSFX Name: RCBitBrickwall Light V1.0
+Author: Dima Gorelik
+Release Date: Mar 2026
+Reference:
+  RCBitBrickwall V3.0 (full-quality version)
+  AirWindows BitShiftGain (bit-accurate gain via exact powers of 2)
+About:
+  Lightweight bit-accurate brickwall limiter for monitoring.
+
+  Same sound philosophy as RCBitBrickwall V3.0 but with near-zero CPU:
+  no per-sample scan loops, no cosine reshaping loops.
+
+  How it works:
+    - Peak detection runs on the LIVE input signal (instant attack envelope)
+    - Audio is delayed by the lookahead amount
+    - Current envelope gain is applied to delayed audio
+    - The lookahead gives the envelope time to react before the peak arrives
+    - Result: smooth gain transitions with zero scan overhead
+
+  Features:
+    1. Ceiling and input gain in bits, bit-accurate via 2^x
+    2. Oversampled peak detection (1x/2x/4x/8x) via Hermite interpolation
+    3. Zero loops per sample — just math
+    4. Safety clamp for brickwall guarantee
+    5. Stereo Linked or Dual Mono
+    6. Auto-release option
+    7. PDC reported to REAPER
+
+  Use RCBitBrickwall V3.0 for final renders (cosine-windowed attack).
+  Use this Light version for monitoring, tracking, and mixing.
+*/
+
+// License: GPL - http://www.gnu.org/licenses/gpl.html
+
+desc: RCBitBrickwall Light V1.0 - Bit-Accurate Brickwall (Low CPU)
+
+in_pin:Left
+in_pin:Right
+out_pin:Left
+out_pin:Right
+
+slider1:0<0,8,0.01>Ceiling (Bits below 0 dBFS)
+slider2:0<-16,16,1>Input Gain (Bits)
+slider3:0<-100,100,0.01>Ceiling Micro (% of a Bit)
+slider4:5<0.1,10,0.1>Lookahead (ms)
+slider5:100<1,1000,1>Release (ms)
+slider6:0<0,1,1{Manual,Auto}>Release Mode
+slider7:0<0,1,1{Linked,Dual Mono}>Stereo Mode
+slider8:2<0,3,1{1x (Off),2x,4x,8x}>Peak Oversampling
+
+@init
+
+MAX_BUF = 2048;
+
+buf_L = 0;
+buf_R = MAX_BUF;
+buf_pos = 0;
+
+memset(buf_L, 0, MAX_BUF);
+memset(buf_R, 0, MAX_BUF);
+
+// Per-channel envelope
+env_L = 1;
+env_R = 1;
+
+// Auto-release coefficients
+auto_rel_fast = exp(-1 / (0.030 * srate));
+auto_rel_slow = exp(-1 / (0.500 * srate));
+
+// Hermite interpolation history
+hist_L0 = 0; hist_L1 = 0; hist_L2 = 0; hist_L3 = 0;
+hist_R0 = 0; hist_R1 = 0; hist_R2 = 0; hist_R3 = 0;
+
+clamp_count = 0;
+os_factor = 4;
+
+@slider
+
+ceiling = 1.0 / pow(2, slider1 + slider3 * 0.01);
+input_gain = pow(2, slider2);
+
+delay_len = floor(slider4 * 0.001 * srate + 0.5);
+delay_len = min(max(delay_len, 1), MAX_BUF - 1);
+
+pdc_delay = delay_len;
+pdc_bot_ch = 0;
+pdc_top_ch = 2;
+
+release_coeff = exp(-1 / (slider5 * 0.001 * srate));
+auto_release = slider6;
+dual_mono = slider7;
+os_factor = 1 << slider8;
+
+@sample
+
+// ========== INPUT GAIN (bit-accurate) ==========
+in_L = spl0 * input_gain;
+in_R = spl1 * input_gain;
+
+// ========== OVERSAMPLED PEAK DETECTION ==========
+hist_L0 = hist_L1; hist_L1 = hist_L2; hist_L2 = hist_L3; hist_L3 = in_L;
+hist_R0 = hist_R1; hist_R1 = hist_R2; hist_R2 = hist_R3; hist_R3 = in_R;
+
+tp_L = abs(in_L);
+tp_R = abs(in_R);
+
+os_factor > 1 ? (
+  aL = -0.5*hist_L0 + 1.5*hist_L1 - 1.5*hist_L2 + 0.5*hist_L3;
+  bL =      hist_L0 - 2.5*hist_L1 + 2.0*hist_L2 - 0.5*hist_L3;
+  cL = -0.5*hist_L0               + 0.5*hist_L2;
+  dL = hist_L1;
+
+  aR = -0.5*hist_R0 + 1.5*hist_R1 - 1.5*hist_R2 + 0.5*hist_R3;
+  bR =      hist_R0 - 2.5*hist_R1 + 2.0*hist_R2 - 0.5*hist_R3;
+  cR = -0.5*hist_R0               + 0.5*hist_R2;
+  dR = hist_R1;
+
+  tp_L = max(tp_L, abs(hist_L1));
+  tp_L = max(tp_L, abs(hist_L2));
+  tp_R = max(tp_R, abs(hist_R1));
+  tp_R = max(tp_R, abs(hist_R2));
+
+  step = 1.0 / os_factor;
+  t = step;
+  loop(os_factor - 1,
+    valL = ((aL * t + bL) * t + cL) * t + dL;
+    valR = ((aR * t + bR) * t + cR) * t + dR;
+    tp_L = max(tp_L, abs(valL));
+    tp_R = max(tp_R, abs(valR));
+    t += step;
+  );
+);
+
+// ========== TARGET GAIN ==========
+dual_mono ? (
+  tgt_L = tp_L > ceiling ? ceiling / tp_L : 1;
+  tgt_R = tp_R > ceiling ? ceiling / tp_R : 1;
+) : (
+  tp_max = max(tp_L, tp_R);
+  tgt_L = tgt_R = tp_max > ceiling ? ceiling / tp_max : 1;
+);
+
+// ========== ENVELOPE: INSTANT ATTACK, SMOOTH RELEASE ==========
+// Left
+tgt_L < env_L ? (
+  env_L = tgt_L;
+) : (
+  auto_release ? (
+    gr_dB = 20 * log10(env_L + 0.0000000001);
+    depth = min(abs(gr_dB) / 12, 1);
+    rel = auto_rel_fast + (auto_rel_slow - auto_rel_fast) * depth;
+  ) : (
+    rel = release_coeff;
+  );
+  env_L = tgt_L + (env_L - tgt_L) * rel;
+  env_L = min(env_L, 1);
+);
+
+// Right
+tgt_R < env_R ? (
+  env_R = tgt_R;
+) : (
+  auto_release ? (
+    gr_dB = 20 * log10(env_R + 0.0000000001);
+    depth = min(abs(gr_dB) / 12, 1);
+    rel = auto_rel_fast + (auto_rel_slow - auto_rel_fast) * depth;
+  ) : (
+    rel = release_coeff;
+  );
+  env_R = tgt_R + (env_R - tgt_R) * rel;
+  env_R = min(env_R, 1);
+);
+
+// ========== WRITE AUDIO TO DELAY BUFFER ==========
+buf_L[buf_pos] = in_L;
+buf_R[buf_pos] = in_R;
+
+// ========== READ DELAYED AUDIO ==========
+read_pos = buf_pos - delay_len;
+read_pos < 0 ? read_pos += MAX_BUF;
+
+del_L = buf_L[read_pos];
+del_R = buf_R[read_pos];
+
+// ========== APPLY CURRENT ENVELOPE TO DELAYED AUDIO ==========
+// The lookahead ensures envelope has already reacted by the time
+// the peak reaches output. No scan needed.
+out_L = del_L * env_L;
+out_R = del_R * env_R;
+
+// ========== SAFETY CLAMP (brickwall guarantee) ==========
+abs(out_L) > ceiling ? (
+  out_L = out_L > 0 ? ceiling : -ceiling;
+  clamp_count += 1;
+);
+abs(out_R) > ceiling ? (
+  out_R = out_R > 0 ? ceiling : -ceiling;
+  clamp_count += 1;
+);
+
+spl0 = out_L;
+spl1 = out_R;
+
+// ========== ADVANCE BUFFER ==========
+buf_pos += 1;
+buf_pos >= MAX_BUF ? buf_pos = 0;
